@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,53 +42,97 @@ func (cmd *loginCommand) Register(fs *flag.FlagSet) {
 	fs.StringVar(&cmd.password, "p", "", "Password")
 	fs.StringVar(&cmd.password, "password", "", "Password")
 	fs.BoolVar(&cmd.passwordStdin, "password-stdin", false, "Take the password from stdin")
+	fs.BoolVar(&cmd.authConfig, "a", true, "AuthConfig")
+	fs.BoolVar(&cmd.authConfig, "auth-config", true, "AuthConfig")
 }
 
 type loginCommand struct {
 	user          string
 	password      string
 	passwordStdin bool
+	authConfig	  bool
 
 	serverAddress string
 }
 
-func (cmd *loginCommand) Run(ctx context.Context, args []string) error {
-	if cmd.password != "" {
-		logrus.Warnf("WARNING! Using --password via the CLI is insecure. Use --password-stdin.")
-		if cmd.passwordStdin {
-			return errors.New("--password and --password-stdin are mutually exclusive")
-		}
+func base64DecodeAuth(auth string) (types.AuthConfig, error) {
+	var result types.AuthConfig
+
+	buf, err := base64.URLEncoding.DecodeString(auth)
+	if err != nil {
+		return result, err
 	}
 
-	// Handle when the password is coming over stdin.
-	if cmd.passwordStdin {
-		if cmd.user == "" {
-			return errors.New("must provide --username with --password-stdin")
+	if err := json.NewDecoder(bytes.NewReader(buf)).Decode(&result); err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+
+func strinpEndlines(contents string) string {
+	result := strings.TrimSuffix(contents, "\n")
+	result = strings.TrimSuffix(result, "\r")
+	return result
+}
+
+
+func (cmd *loginCommand) Run(ctx context.Context, args []string) error {
+	var dcfg *configfile.ConfigFile
+	var authConfig types.AuthConfig
+	var err error
+
+	if !cmd.authConfig {
+		if cmd.password != "" {
+			logrus.Warnf("WARNING! Using --password via the CLI is insecure. Use --password-stdin.")
+			if cmd.passwordStdin {
+				return errors.New("--password and --password-stdin are mutually exclusive")
+			}
 		}
 
+		// Handle when the password is coming over stdin.
+		if cmd.passwordStdin {
+			if cmd.user == "" {
+				return errors.New("must provide --username with --password-stdin")
+			}
+
+			// Read from stadin.
+			contents, err := ioutil.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+
+			cmd.password = strinpEndlines(string(contents))
+		}
+
+		if len(args) > 0 {
+			cmd.serverAddress = args[0]
+		}
+
+		// Set the default registry server address.
+		if cmd.serverAddress == "" {
+			cmd.serverAddress = defaultDockerRegistry
+		}
+
+		// Get the auth config.
+		dcfg, authConfig, err = configureAuth(cmd.user, cmd.password, cmd.serverAddress)
+		if err != nil {
+			return err
+		}
+	} else {
+		dcfg, err = config.Load(config.Dir())
 		// Read from stadin.
 		contents, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
 
-		cmd.password = strings.TrimSuffix(string(contents), "\n")
-		cmd.password = strings.TrimSuffix(cmd.password, "\r")
-	}
+		authConfigStr := strinpEndlines(string(contents))
 
-	if len(args) > 0 {
-		cmd.serverAddress = args[0]
-	}
-
-	// Set the default registry server address.
-	if cmd.serverAddress == "" {
-		cmd.serverAddress = defaultDockerRegistry
-	}
-
-	// Get the auth config.
-	dcfg, authConfig, err := configureAuth(cmd.user, cmd.password, cmd.serverAddress)
-	if err != nil {
-		return err
+		if authConfig, err = base64DecodeAuth(authConfigStr); err != nil {
+			return err
+		}
 	}
 
 	// Attempt to login to the registry.
@@ -93,15 +140,18 @@ func (cmd *loginCommand) Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating registry client failed: %v", err)
 	}
-	token, err := r.Token(r.URL)
-	if err != nil && err != registryapi.ErrBasicAuth {
-		return fmt.Errorf("getting registry token failed: %v", err)
-	}
 
-	// Configure the token.
-	if token != "" {
-		authConfig.Password = ""
-		authConfig.IdentityToken = token
+	if authConfig.IdentityToken != "" {
+		token, err := r.Token(r.URL)
+		if err != nil && err != registryapi.ErrBasicAuth {
+			return fmt.Errorf("getting registry token failed: %v", err)
+		}
+
+		// Configure the token.
+		if token != "" {
+			authConfig.Password = ""
+			authConfig.IdentityToken = token
+		}
 	}
 
 	// Save the config value.
