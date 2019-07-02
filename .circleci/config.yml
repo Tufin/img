@@ -5,8 +5,6 @@ jobs:
    steps:
      - checkout
     
-     - setup_remote_docker
-
      # login to docker
      - run: echo ${DOCKER_PASS} | docker login -u ${DOCKER_USER} --password-stdin
 
